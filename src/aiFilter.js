@@ -47,12 +47,20 @@ function heuristicFilter(query, results) {
 
 /**
  * Non-streaming OpenRouter chat (filter needs full JSON)
- * Same auth/model family as:
- *   openrouter.chat.send({ model: "nvidia/nemotron-3.5-lightning:free", ... })
  */
-async function openRouterChat(messages, { temperature = 0.2, max_tokens = 900 } = {}) {
+async function openRouterChat(messages, { temperature = 0, max_tokens = 500 } = {}) {
   const { apiKey, model } = getAiConfig();
   if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
+
+  const body = {
+    model,
+    messages,
+    temperature,
+    max_tokens,
+    stream: false,
+    // Force the model to treat this as structured output
+    response_format: { type: "json_object" },
+  };
 
   const res = await fetch(OPENROUTER_URL, {
     method: "POST",
@@ -62,13 +70,7 @@ async function openRouterChat(messages, { temperature = 0.2, max_tokens = 900 } 
       "HTTP-Referer": "https://witherly-api.witherly-api.workers.dev",
       "X-Title": "Witherly Web Search Filter",
     },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature,
-      max_tokens,
-      stream: false,
-    }),
+    body: JSON.stringify(body),
   });
 
   const data = await res.json().catch(() => ({}));
@@ -78,8 +80,16 @@ async function openRouterChat(messages, { temperature = 0.2, max_tokens = 900 } 
     );
   }
 
+  // Prefer content; some providers put final answer in reasoning_content
+  const message = data?.choices?.[0]?.message || {};
+  const content =
+    message.content ||
+    message.reasoning_content ||
+    message.reasoning ||
+    "";
+
   return {
-    content: data?.choices?.[0]?.message?.content || "",
+    content: String(content || ""),
     model: data?.model || model,
     usage: data?.usage || null,
   };
@@ -106,36 +116,53 @@ async function aiFilterResults(query, results) {
     )
     .join("\n\n");
 
-  const system = `You are Witherly AI's web relevance filter.
-Given a user query and scraped web results, keep only useful sources.
-Reply with STRICT JSON only — no markdown fences:
-{
-  "keep": [1, 3, 5],
-  "summary": "2-4 sentence neutral briefing from the kept sources only"
-}
-Rules:
-- keep = 1-based indexes, max 6
-- Drop spam, off-topic, login walls, pure ads
-- Do not invent facts not present in the snippets`;
+  // Extremely strict prompt — Nemotron otherwise spends all tokens on reasoning
+  const system = `You are a JSON-only web relevance filter.
 
-  const user = `Query: ${query}\n\nResults:\n${catalog}`;
+You MUST reply with ONE valid JSON object and NOTHING else.
+No markdown, no <think>, no explanation, no reasoning text.
+
+Exact schema:
+{"keep":[1,3],"summary":"2-4 sentence briefing from the kept sources only"}
+
+Rules:
+- keep = 1-based indexes of the most useful results (max 6)
+- Drop spam, login walls, pure ads, off-topic pages
+- summary must be neutral and based only on the kept snippets
+- If nothing is useful, return {"keep":[],"summary":""}`;
+
+  const user = `Query: ${query}
+
+Results:
+${catalog}
+
+Return the JSON object now.`;
 
   try {
-    const { content, model, usage } = await openRouterChat([
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ]);
+    const { content, model, usage } = await openRouterChat(
+      [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      { temperature: 0, max_tokens: 450 }
+    );
 
     if (usage) {
       console.log("[aiFilter] usage", usage);
     }
 
+    // Strip any leftover reasoning / think tags / fences
     let text = String(content || "")
+      .replace(/<think>[\s\S]*?<\/think>/gi, "")
       .replace(/```json\s*/gi, "")
       .replace(/```/g, "")
       .trim();
+
     const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error("Model returned no JSON object");
+    if (!jsonMatch) {
+      console.warn("[aiFilter] raw content (no JSON):", text.slice(0, 300));
+      throw new Error("Model returned no JSON object");
+    }
 
     const parsed = JSON.parse(jsonMatch[0]);
     const keep = Array.isArray(parsed.keep) ? parsed.keep : [];
