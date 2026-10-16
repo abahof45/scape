@@ -45,10 +45,7 @@ function heuristicFilter(query, results) {
   return scored.filter((r) => r.relevance > 0 || scored.length <= 3);
 }
 
-/**
- * Non-streaming OpenRouter chat (filter needs full JSON)
- */
-async function openRouterChat(messages, { temperature = 0, max_tokens = 500 } = {}) {
+async function openRouterChat(messages, { temperature = 0, max_tokens = 300 } = {}) {
   const { apiKey, model } = getAiConfig();
   if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
 
@@ -58,7 +55,6 @@ async function openRouterChat(messages, { temperature = 0, max_tokens = 500 } = 
     temperature,
     max_tokens,
     stream: false,
-    // Force the model to treat this as structured output
     response_format: { type: "json_object" },
   };
 
@@ -80,7 +76,6 @@ async function openRouterChat(messages, { temperature = 0, max_tokens = 500 } = 
     );
   }
 
-  // Prefer content; some providers put final answer in reasoning_content
   const message = data?.choices?.[0]?.message || {};
   const content =
     message.content ||
@@ -116,7 +111,6 @@ async function aiFilterResults(query, results) {
     )
     .join("\n\n");
 
-  // Extremely strict prompt — Nemotron otherwise spends all tokens on reasoning
   const system = `You are a JSON-only web relevance filter.
 
 You MUST reply with ONE valid JSON object and NOTHING else.
@@ -144,27 +138,44 @@ Return the JSON object now.`;
         { role: "system", content: system },
         { role: "user", content: user },
       ],
-      { temperature: 0, max_tokens: 450 }
+      { temperature: 0, max_tokens: 300 }
     );
 
     if (usage) {
       console.log("[aiFilter] usage", usage);
     }
 
-    // Strip any leftover reasoning / think tags / fences
     let text = String(content || "")
       .replace(/<think>[\s\S]*?<\/think>/gi, "")
       .replace(/```json\s*/gi, "")
       .replace(/```/g, "")
       .trim();
 
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    const jsonMatch = text.match(/\{[\s\S]*?\}/);
     if (!jsonMatch) {
-      console.warn("[aiFilter] raw content (no JSON):", text.slice(0, 300));
+      console.warn("[aiFilter] raw content (no JSON):", text.slice(0, 400));
       throw new Error("Model returned no JSON object");
     }
 
-    const parsed = JSON.parse(jsonMatch[0]);
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonMatch[0]);
+    } catch (parseErr) {
+      // Try cutting after the last }
+      const lastBrace = text.lastIndexOf("}");
+      if (lastBrace > 0) {
+        const candidate = text.slice(0, lastBrace + 1);
+        const m = candidate.match(/\{[\s\S]*\}/);
+        if (m) {
+          parsed = JSON.parse(m[0]);
+        } else {
+          throw parseErr;
+        }
+      } else {
+        throw parseErr;
+      }
+    }
+
     const keep = Array.isArray(parsed.keep) ? parsed.keep : [];
     const summary = String(parsed.summary || "").trim();
 
