@@ -1,5 +1,5 @@
 /**
- * Own HTML scraper — DuckDuckGo HTML results + optional page fetch
+ * Own HTML scraper — DuckDuckGo + SearXNG + Wikipedia
  * No paid search API keys.
  */
 
@@ -71,49 +71,6 @@ function unwrapDdgRedirect(href) {
 }
 
 /**
- * Try HTML endpoint, then Lite endpoint as fallback
- */
-async function scrapeDuckDuckGoHtml(query, num = 8) {
-  const attempts = [
-    // Primary – classic HTML results
-    "https://html.duckduckgo.com/html/?" +
-      new URLSearchParams({ q: query }).toString(),
-
-    // Fallback – Lite version (often less blocked)
-    "https://lite.duckduckgo.com/lite/?" +
-      new URLSearchParams({ q: query }).toString(),
-  ];
-
-  let lastError = null;
-
-  for (const target of attempts) {
-    for (let tryCount = 1; tryCount <= 2; tryCount++) {
-      try {
-        const html = await fetchText(target, 14000);
-        const results = parseDdgHtml(html, num);
-
-        if (results.length > 0) {
-          console.log(
-            `[scrape] DDG ok via ${target.includes("lite") ? "lite" : "html"} (${results.length} results)`
-          );
-          return results;
-        }
-      } catch (e) {
-        lastError = e;
-        console.warn(
-          `[scrape] DDG attempt failed (${target.includes("lite") ? "lite" : "html"} try ${tryCount}):`,
-          e.message
-        );
-        // small delay before retry
-        await new Promise((r) => setTimeout(r, 400 * tryCount));
-      }
-    }
-  }
-
-  throw lastError || new Error("DDG scrape failed after all attempts");
-}
-
-/**
  * Parse both HTML and Lite result pages
  */
 function parseDdgHtml(html, num) {
@@ -168,6 +125,45 @@ function parseDdgHtml(html, num) {
   }
 
   return results;
+}
+
+/**
+ * Try HTML endpoint, then Lite endpoint as fallback
+ */
+async function scrapeDuckDuckGoHtml(query, num = 8) {
+  const attempts = [
+    "https://html.duckduckgo.com/html/?" +
+      new URLSearchParams({ q: query }).toString(),
+    "https://lite.duckduckgo.com/lite/?" +
+      new URLSearchParams({ q: query }).toString(),
+  ];
+
+  let lastError = null;
+
+  for (const target of attempts) {
+    for (let tryCount = 1; tryCount <= 2; tryCount++) {
+      try {
+        const html = await fetchText(target, 14000);
+        const results = parseDdgHtml(html, num);
+
+        if (results.length > 0) {
+          console.log(
+            `[scrape] DDG ok via ${target.includes("lite") ? "lite" : "html"} (${results.length} results)`
+          );
+          return results;
+        }
+      } catch (e) {
+        lastError = e;
+        console.warn(
+          `[scrape] DDG attempt failed (${target.includes("lite") ? "lite" : "html"} try ${tryCount}):`,
+          e.message
+        );
+        await new Promise((r) => setTimeout(r, 400 * tryCount));
+      }
+    }
+  }
+
+  throw lastError || new Error("DDG scrape failed after all attempts");
 }
 
 /**
@@ -260,7 +256,54 @@ async function scrapeWikipedia(query, num = 3) {
 }
 
 /**
+ * Scrape a public SearXNG instance (JSON API)
+ */
+async function scrapeSearx(query, num = 6) {
+  const instances = [
+    "https://searx.be",
+    "https://search.sapti.me",
+    "https://searx.tiekoetter.com",
+    "https://searx.prvcy.eu",
+  ];
+
+  const params = new URLSearchParams({
+    q: query,
+    format: "json",
+    categories: "general",
+    language: "en",
+  });
+
+  for (const base of instances) {
+    try {
+      const url = `${base}/search?${params.toString()}`;
+      const text = await fetchText(url, 10000);
+      const data = JSON.parse(text);
+
+      const rows = Array.isArray(data?.results) ? data.results : [];
+      if (!rows.length) continue;
+
+      console.log(`[scrape] SearXNG ok via ${base} (${rows.length} results)`);
+
+      return rows
+        .slice(0, num)
+        .map((r) => ({
+          title: stripTags(r.title || "").slice(0, 200),
+          link: r.url || r.link || "",
+          snippet: stripTags(r.content || r.snippet || "").slice(0, 400),
+          source: "searx",
+        }))
+        .filter((r) => r.link && r.title);
+    } catch (e) {
+      console.warn(`[scrape] SearXNG failed (${base}):`, e.message);
+    }
+  }
+
+  return [];
+}
+
+/**
  * Full scrape pipeline
+ * Order: DuckDuckGo → SearXNG → Wikipedia
  */
 async function scrapeSearch(query, options = {}) {
   const q = String(query || "").trim();
@@ -271,13 +314,26 @@ async function scrapeSearch(query, options = {}) {
 
   let results = [];
 
+  // 1. DuckDuckGo
   try {
     results = await scrapeDuckDuckGoHtml(q, num);
   } catch (e) {
     console.warn("[scrape] DDG failed:", e.message);
   }
 
-  // Always try Wikipedia as backup / supplement
+  // 2. SearXNG if DDG gave almost nothing
+  if (results.length < 3) {
+    const searx = await scrapeSearx(q, num);
+    const seen = new Set(results.map((r) => r.link));
+    for (const r of searx) {
+      if (!seen.has(r.link)) {
+        results.push(r);
+        seen.add(r.link);
+      }
+    }
+  }
+
+  // 3. Wikipedia as final safety net
   if (results.length < 3) {
     const wiki = await scrapeWikipedia(q, 4);
     const seen = new Set(results.map((r) => r.link));
