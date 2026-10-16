@@ -3,8 +3,8 @@
  * No paid search API keys.
  */
 
-const UA =
-  "Mozilla/5.0 (compatible; WitherlyBot/1.0; +https://witherly-api.workers.dev)";
+const BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
 
 function decodeHtml(s) {
   return String(s || "")
@@ -24,20 +24,34 @@ function stripTags(s) {
     .trim();
 }
 
-async function fetchText(url, timeoutMs = 12000) {
+async function fetchText(url, timeoutMs = 14000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
+
   try {
     const res = await fetch(url, {
       signal: ctrl.signal,
       redirect: "follow",
       headers: {
-        "User-Agent": UA,
-        Accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        "User-Agent": BROWSER_UA,
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
       },
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
     return await res.text();
   } finally {
     clearTimeout(t);
@@ -57,17 +71,55 @@ function unwrapDdgRedirect(href) {
 }
 
 /**
- * Scrape DuckDuckGo HTML search page for organic results
+ * Try HTML endpoint, then Lite endpoint as fallback
  */
 async function scrapeDuckDuckGoHtml(query, num = 8) {
-  const target =
+  const attempts = [
+    // Primary – classic HTML results
     "https://html.duckduckgo.com/html/?" +
-    new URLSearchParams({ q: query }).toString();
+      new URLSearchParams({ q: query }).toString(),
 
-  const html = await fetchText(target, 14000);
+    // Fallback – Lite version (often less blocked)
+    "https://lite.duckduckgo.com/lite/?" +
+      new URLSearchParams({ q: query }).toString(),
+  ];
+
+  let lastError = null;
+
+  for (const target of attempts) {
+    for (let tryCount = 1; tryCount <= 2; tryCount++) {
+      try {
+        const html = await fetchText(target, 14000);
+        const results = parseDdgHtml(html, num);
+
+        if (results.length > 0) {
+          console.log(
+            `[scrape] DDG ok via ${target.includes("lite") ? "lite" : "html"} (${results.length} results)`
+          );
+          return results;
+        }
+      } catch (e) {
+        lastError = e;
+        console.warn(
+          `[scrape] DDG attempt failed (${target.includes("lite") ? "lite" : "html"} try ${tryCount}):`,
+          e.message
+        );
+        // small delay before retry
+        await new Promise((r) => setTimeout(r, 400 * tryCount));
+      }
+    }
+  }
+
+  throw lastError || new Error("DDG scrape failed after all attempts");
+}
+
+/**
+ * Parse both HTML and Lite result pages
+ */
+function parseDdgHtml(html, num) {
   const results = [];
 
-  // result links
+  // Classic HTML results
   const linkRe =
     /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
   const snipRe =
@@ -87,12 +139,32 @@ async function scrapeDuckDuckGoHtml(query, num = 8) {
     if (!href || !title) continue;
     if (/duckduckgo\.com/i.test(href)) continue;
     if (!/^https?:\/\//i.test(href)) continue;
+
     results.push({
       title: title.slice(0, 200),
       link: href,
       snippet: (snippets[i] || "").slice(0, 400),
     });
     i += 1;
+  }
+
+  // Lite results (different markup)
+  if (results.length === 0) {
+    const liteRe =
+      /<a[^>]+rel="nofollow"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    while ((m = liteRe.exec(html)) && results.length < num) {
+      let href = unwrapDdgRedirect(decodeHtml(m[1]));
+      const title = stripTags(m[2]);
+      if (!href || !title) continue;
+      if (/duckduckgo\.com/i.test(href)) continue;
+      if (!/^https?:\/\//i.test(href)) continue;
+
+      results.push({
+        title: title.slice(0, 200),
+        link: href,
+        snippet: "",
+      });
+    }
   }
 
   return results;
@@ -137,19 +209,20 @@ async function scrapePage(url, timeoutMs = 8000) {
 async function enrichResults(results, maxPages = 3) {
   const out = [...results];
   const n = Math.min(maxPages, out.length);
+
   await Promise.all(
-    out.slice(0, n).map(async (r, idx) => {
+    out.slice(0, n).map(async (r) => {
       const page = await scrapePage(r.link);
       if (!page) return;
       if (!r.snippet && page.description) r.snippet = page.description;
       if (!r.snippet && page.text) r.snippet = page.text.slice(0, 300);
       if (page.title && page.title.length > 5) {
-        // keep original title if better; optionally note
         r.pageTitle = page.title;
       }
       r.scraped = true;
     })
   );
+
   return out;
 }
 
@@ -172,6 +245,7 @@ async function scrapeWikipedia(query, num = 3) {
     );
     const data = JSON.parse(text);
     const rows = data?.query?.search || [];
+
     return rows.map((row) => ({
       title: row.title,
       link: `https://en.wikipedia.org/wiki/${encodeURIComponent(
@@ -196,12 +270,14 @@ async function scrapeSearch(query, options = {}) {
   const scrapePages = Math.max(0, Number(options.scrapePages ?? 3));
 
   let results = [];
+
   try {
     results = await scrapeDuckDuckGoHtml(q, num);
   } catch (e) {
     console.warn("[scrape] DDG failed:", e.message);
   }
 
+  // Always try Wikipedia as backup / supplement
   if (results.length < 3) {
     const wiki = await scrapeWikipedia(q, 4);
     const seen = new Set(results.map((r) => r.link));
